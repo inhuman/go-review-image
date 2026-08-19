@@ -9,6 +9,11 @@
 # `go build` / `go vet` / `staticcheck` / `golangci-lint` / `govulncheck` run
 # as-is; `go test -race` needs cgo + a C toolchain (gcc + musl-dev below).
 #
+# gopls answers the one question the rest of the battery cannot: WHO ELSE CALLS
+# the thing the diff changed. A compiler stays silent while the code still
+# builds, and it builds right up until the change is carried to half the callers.
+# `go-impact <base-ref>` wraps that into one deterministic report.
+#
 # run_job image for mr-code-review-v2 layer A: clone the MR branch, run the
 # battery, feed the deterministic output back as findings.
 
@@ -17,7 +22,8 @@ FROM golang:1.26-alpine AS build
 ENV GOBIN=/tools
 RUN go install honnef.co/go/tools/cmd/staticcheck@v0.7.0 \
  && go install golang.org/x/vuln/cmd/govulncheck@v1.3.0 \
- && go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+ && go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 \
+ && go install golang.org/x/tools/gopls@v0.23.0
 
 # ── final: Go toolchain (needed for build/vet/test) + tool binaries only ───────
 FROM golang:1.26-alpine
@@ -31,17 +37,27 @@ COPY --from=build /tools/ /usr/local/bin/
 #   /cache/go-review/gomod        — Go modules (GOMODCACHE)
 #   /cache/go-review/gobuild      — Go build artifacts (GOCACHE)
 #   /cache/go-review/staticcheck  — staticcheck's own cache
+#   /cache/go-review/gopls        — gopls' parsed/type-checked workspace cache
 # staticcheck uses os.UserCacheDir() → $XDG_CACHE_HOME/staticcheck on Linux,
 # so pointing XDG_CACHE_HOME at /cache/go-review gives it the right path
-# automatically. Different review-images (python-review, ts-review) get their
-# own /cache/<image>/ subtree — no cross-talk.
+# automatically; gopls uses the same convention. Different review-images
+# (python-review, ts-review) get their own /cache/<image>/ subtree — no cross-talk.
 ENV GOMODCACHE=/cache/go-review/gomod \
     GOCACHE=/cache/go-review/gobuild \
     XDG_CACHE_HOME=/cache/go-review
 
 # Pre-create cache directories. PVC mount root is mode 0755 by default;
 # `mkdir -p` is idempotent, safe on repeated container starts.
-RUN mkdir -p "$GOMODCACHE" "$GOCACHE" "$XDG_CACHE_HOME/staticcheck"
+RUN mkdir -p "$GOMODCACHE" "$GOCACHE" "$XDG_CACHE_HOME/staticcheck" "$XDG_CACHE_HOME/gopls"
 
-RUN go version && staticcheck -version && govulncheck -version && golangci-lint version
+# The container is a throwaway sandbox around a freshly cloned repo, and git's
+# dubious-ownership check turns that into a confusing "not a git repository"
+# whenever the checkout was made by another uid (bind mount, cached PVC clone).
+RUN git config --global --add safe.directory '*'
+
+# Impact report: changed top-level declarations + their callers OUTSIDE the delta.
+COPY bin/go-impact /usr/local/bin/go-impact
+
+RUN go version && staticcheck -version && govulncheck -version \
+ && golangci-lint version && gopls version && go-impact 2>&1 | head -1
 WORKDIR /work
