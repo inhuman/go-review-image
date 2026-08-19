@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# go-impact — что изменилось в дельте и КТО ЭТО ЕЩЁ ЗОВЁТ за её пределами.
+#
+# Дифф показывает только изменённые строки, и вопрос «кого ломает изменённая
+# сигнатура» по нему не отвечается принципиально: вызывающий лежит в файле,
+# которого в дельте нет. Ни один инструмент батареи на этот вопрос не отвечает —
+# сборка молчит, пока код собирается, а он собирается ровно до тех пор, пока
+# правку не докатили до половины вызывающих.
+#
+# gopls отвечает на него ПО ТИПАМ, а не по тексту: одноимённые методы разных
+# типов не путаются, интерфейсные реализации видны.
+#
+# Использование:
+#   go-impact <base-ref> [макс-символов]      (по умолчанию 12)
+#
+# Коды возврата:
+#   0 — отработал (находки в stdout; их отсутствие = изменения локальны)
+#   2 — НЕ отработал (причина в stdout; пустой вывод НЕ означает «всё чисто»)
+
+set -uo pipefail
+export NO_COLOR=1
+
+base=${1:-}
+max_symbols=${2:-12}
+max_refs=5
+
+if [ -z "$base" ]; then
+  echo "go-impact: не задан base-ref"
+  echo "usage: go-impact <base-ref> [макс-символов]"
+  exit 2
+fi
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "go-impact: не git-репозиторий"; exit 2; }
+cd "$root" || exit 2
+
+command -v gopls >/dev/null 2>&1 || { echo "go-impact: gopls не найден в PATH"; exit 2; }
+[ -f go.mod ] || { echo "go-impact: в корне нет go.mod — gopls не сможет загрузить модуль"; exit 2; }
+
+# Диапазон дельты. Три точки (изменения с точки расхождения) — то, что показывает
+# MR; если базы нет в клоне (shallow), честно отказываемся, а не сравниваем не с тем.
+if git rev-parse --verify -q "$base" >/dev/null; then
+  if git merge-base --is-ancestor "$base" HEAD 2>/dev/null; then
+    range="$base...HEAD"
+  else
+    range="$base..HEAD"
+  fi
+else
+  echo "go-impact: базовый ref '$base' отсутствует в клоне (shallow?) — сравнивать не с чем"
+  exit 2
+fi
+
+mapfile -t files < <(git diff --name-only "$range" -- '*.go' 2>/dev/null | grep -v '_test\.go$')
+if [ ${#files[@]} -eq 0 ]; then
+  echo "== IMPACT =="
+  echo "(в дельте нет изменённых .go вне тестов)"
+  echo "EXIT=0"
+  exit 0
+fi
+
+# Множество файлов дельты — ссылки внутри него человек и так видит в диффе.
+declare -A in_delta=()
+for f in "${files[@]}"; do in_delta["$f"]=1; done
+
+echo "== IMPACT =="
+echo "база: $base   изменённых .go (без тестов): ${#files[@]}"
+
+reported=0
+truncated=0
+
+for f in "${files[@]}"; do
+  [ -f "$f" ] || continue   # файл удалён в дельте — ссылок на него уже нет по определению
+
+  # Изменённые строки файла: @@ -a,b +c,d @@ → перечень c..c+d-1.
+  mapfile -t changed < <(git diff -U0 "$range" -- "$f" 2>/dev/null | awk '
+    /^@@/ { split($3, a, ","); s = substr(a[1], 2) + 0; n = (a[2] == "" ? 1 : a[2] + 0);
+            for (i = 0; i < n; i++) print s + i }')
+  [ ${#changed[@]} -eq 0 ] && continue
+
+  # Объявления верхнего уровня: без ведущего таба, «имя вид строка:кол-строка:кол».
+  syms=$(timeout 120 gopls symbols "$f" 2>/dev/null | grep -v $'^\t' | awk '
+    { split($3, r, "-"); split(r[1], p, ":"); print p[1] "\t" p[2] "\t" $1 "\t" $2 }' | sort -n)
+  if [ -z "$syms" ]; then
+    echo "  $f: gopls не отдал символы — файл пропущен (это НЕ «изменений нет»)"
+    continue
+  fi
+
+  # Границей объявления служит начало следующего: gopls отдаёт диапазон ИМЕНИ,
+  # а не тела, и без этого правка внутри функции не сопоставилась бы ни с чем.
+  mapfile -t starts < <(echo "$syms" | cut -f1)
+  idx=0
+  while IFS=$'\t' read -r line col name kind; do
+    idx=$((idx + 1))
+    next=${starts[$idx]:-999999}
+    hit=0
+    for c in "${changed[@]}"; do
+      if [ "$c" -ge "$line" ] && [ "$c" -lt "$next" ]; then hit=1; break; fi
+    done
+    [ $hit -eq 1 ] || continue
+
+    if [ "$reported" -ge "$max_symbols" ]; then truncated=1; break; fi
+    reported=$((reported + 1))
+
+    refs=$(timeout 120 gopls references "$f:$line:$col" 2>/dev/null | sed "s#^$root/##")
+    rc=$?
+    if [ $rc -ne 0 ] && [ -z "$refs" ]; then
+      echo "  $f: $name ($kind) — gopls references упал (exit=$rc), ссылки НЕ проверены"
+      continue
+    fi
+
+    # Ссылку внутри дельты человек и так видит в диффе; интересны только внешние.
+    outside=$(printf '%s\n' "$refs" | while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      rf=${r%%:*}
+      [ -n "${in_delta[$rf]:-}" ] && continue
+      case "$rf" in *_test.go) continue ;; esac
+      echo "${r%%-*}"
+    done)
+    tests=$(printf '%s\n' "$refs" | grep -c '_test\.go:' || true)
+    n=$(printf '%s' "$outside" | grep -c . || true)
+
+    if [ "${n:-0}" -gt 0 ]; then
+      echo "  $f: $name ($kind) — вызывающих ВНЕ дельты: $n, в тестах: $tests"
+      printf '%s\n' "$outside" | head -"$max_refs" | sed 's/^/    /'
+      [ "$n" -gt "$max_refs" ] && echo "    … и ещё $((n - max_refs))"
+    else
+      echo "  $f: $name ($kind) — вне дельты не используется (в тестах: $tests)"
+    fi
+  done <<< "$syms"
+  [ $truncated -eq 1 ] && break
+done
+
+if [ $reported -eq 0 ]; then
+  echo "(изменённых объявлений верхнего уровня не нашлось — правки внутри тел/комментариев)"
+fi
+[ $truncated -eq 1 ] && echo "(показаны первые $max_symbols изменённых объявлений)"
+echo "EXIT=0"
+exit 0
